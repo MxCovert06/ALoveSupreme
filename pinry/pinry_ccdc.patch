@@ -1,0 +1,298 @@
+diff -ruN -x __pycache__ -x node_modules -x .DS_Store orig/core/models.py new/core/models.py
+--- a/core/models.py	2026-11-21 16:29:59.836000045 +0000
++++ b/core/models.py	2026-11-21 16:31:15.426000081 +0000
+@@ -1,3 +1,7 @@
++import ipaddress
++import socket
++from urllib.parse import urlparse, urljoin
++
+ import PIL.Image
+ import requests
+ 
+@@ -33,17 +37,69 @@
+             fp.seek(0)
+             return True
+ 
++    # CCDC: hard limits for remote fetches
++    _MAX_BYTES = 10 * 1024 * 1024
++    _MAX_REDIRECTS = 3
++    _EXT_BY_FORMAT = {'JPEG': 'jpg', 'PNG': 'png', 'GIF': 'gif',
++                      'WEBP': 'webp', 'BMP': 'bmp'}
++
++    @staticmethod
++    def _assert_public_url(url):
++        # CCDC: block SSRF - only http(s) to public, non-internal addresses
++        p = urlparse(url)
++        if p.scheme not in ('http', 'https') or not p.hostname:
++            raise ValueError('bad scheme/host')
++        # escape hatch if the scoring engine pins from an internal host:
++        # PIN_FETCH_ALLOW_HOSTS = ['10.0.0.20'] in local_settings.py
++        if p.hostname in getattr(settings, 'PIN_FETCH_ALLOW_HOSTS', []):
++            return
++        port = p.port or (443 if p.scheme == 'https' else 80)
++        for info in socket.getaddrinfo(p.hostname, port, proto=socket.IPPROTO_TCP):
++            ip = ipaddress.ip_address(info[4][0].split('%')[0])
++            if (ip.is_private or ip.is_loopback or ip.is_link_local or
++                    ip.is_multicast or ip.is_reserved or ip.is_unspecified):
++                raise ValueError('internal address blocked: %s' % ip)
++
++    def _safe_get(self, url, headers):
++        for _ in range(self._MAX_REDIRECTS + 1):
++            self._assert_public_url(url)
++            r = requests.get(url, headers=headers, timeout=(5, 10),
++                             allow_redirects=False, stream=True)
++            if r.is_redirect:
++                url = urljoin(url, r.headers.get('location', ''))
++                r.close()
++                continue
++            buf = BytesIO()
++            for chunk in r.iter_content(64 * 1024):
++                buf.write(chunk)
++                if buf.tell() > self._MAX_BYTES:
++                    r.close()
++                    raise ValueError('remote image too large')
++            r.close()
++            return buf
++        raise ValueError('too many redirects')
++
+     # FIXME: Move this into an asynchronous task
+     def create_for_url(self, url, referer=None):
+-        file_name = url.split("/")[-1].split('#')[0].split('?')[0]
+-        buf = BytesIO()
+         headers = dict(self._default_ua)
+         if referer is not None:
+             headers["Referer"] = referer
+-        response = requests.get(url, headers=headers)
+-        buf.write(response.content)
++        try:
++            buf = self._safe_get(url, headers)
++        except (ValueError, OSError, requests.RequestException):
++            return None
+         if not self._is_valid_image(buf):
+             return None
++        # CCDC: never trust the remote filename/extension (x.html polyglots)
++        try:
++            fmt = PIL.Image.open(buf).format
++        except Exception:
++            return None
++        buf.seek(0, 2)
++        ext = self._EXT_BY_FORMAT.get(fmt)
++        if ext is None:
++            return None
++        file_name = 'remote.' + ext
+         obj = InMemoryUploadedFile(buf, 'image', file_name,
+                                    None, buf.tell(), None)
+         # create the image and its thumbnails in one transaction, removing
+@@ -117,6 +173,11 @@
+ @receiver(models.signals.post_delete, sender=Pin)
+ def delete_pin_images(sender, instance, **kwargs):
+     try:
+-        instance.image.delete()
++        image = instance.image
+     except Image.DoesNotExist:
+-        pass
++        return
++    # CCDC: only delete the image if no OTHER pin still uses it
++    # (upstream deleted it unconditionally -> cascade-deleted other users' pins)
++    if Pin.objects.filter(image_id=image.pk).exclude(pk=instance.pk).exists():
++        return
++    image.delete()
+diff -ruN -x __pycache__ -x node_modules -x .DS_Store orig/core/serializers.py new/core/serializers.py
+--- a/core/serializers.py	2026-11-21 16:29:59.836000045 +0000
++++ b/core/serializers.py	2026-11-21 16:30:28.308000059 +0000
+@@ -1,3 +1,5 @@
++from urllib.parse import urlparse
++
+ from django.conf import settings
+ from django.db.models import Q
+ from rest_framework import serializers
+@@ -114,6 +116,32 @@
+         required=False,
+     )
+ 
++    # CCDC: block javascript:/data: links (rendered as <a :href> in the SPA)
++    @staticmethod
++    def _http_only(value):
++        if value and urlparse(value.strip()).scheme.lower() not in ('http', 'https'):
++            raise ValidationError("only http(s) URLs are allowed")
++        return value.strip() if value else value
++
++    def validate_url(self, value):
++        return self._http_only(value)
++
++    def validate_referer(self, value):
++        return self._http_only(value)
++
++    def validate_description(self, value):
++        # CCDC: SPA niceLinks() doesn't escape quotes -> attribute-injection XSS
++        if value:
++            value = value.replace('"', '').replace('`', '')
++        return value
++
++    def validate_image_by_id(self, image):
++        # CCDC: can't attach (and later delete) another user's image
++        user = self.context['request'].user
++        if image.pin.exclude(submitter=user).exists():
++            raise ValidationError("image belongs to another user")
++        return image
++
+     def create(self, validated_data):
+         if 'url' not in validated_data and\
+                 'image_by_id' not in validated_data:
+diff -ruN -x __pycache__ -x node_modules -x .DS_Store orig/docker/nginx/sites-enabled/default new/docker/nginx/sites-enabled/default
+--- a/docker/nginx/sites-enabled/default	2026-11-21 16:29:59.844000045 +0000
++++ b/docker/nginx/sites-enabled/default	2026-11-21 16:30:48.772000068 +0000
+@@ -9,6 +9,8 @@
+ 
+     client_max_body_size 50M;
+     add_header X-Frame-Options sameorigin always;
++    add_header X-Content-Type-Options nosniff always;
++    server_tokens off;
+ 
+     
+     location /static {
+@@ -16,13 +18,20 @@
+         expires max;
+         access_log off;
+     }
++    # CCDC: uploads are served as inert files only - no HTML/JS/SVG execution,
++    # and logged so webshell/polyglot hits are visible to the log watcher
+     location /media {
+         alias /data/static/media;
+         expires max;
+-        access_log off;
++        types { image/jpeg jpg jpeg; image/png png; image/gif gif; image/webp webp; image/bmp bmp; }
++        default_type application/octet-stream;
++        add_header X-Content-Type-Options nosniff always;
++        add_header Content-Security-Policy "default-src 'none'; sandbox" always;
++        location ~* \.(php\d?|phtml|phar|py|pl|cgi|sh|html?|svgz?|js|jsp|aspx?)$ { return 403; }
+     }
+ 
+     location /api {
++        proxy_set_header X-Forwarded-Host "";
+         proxy_set_header Host $host;
+         proxy_set_header X-Real-IP $remote_addr;
+         proxy_set_header X-Forwarded-For $remote_addr;
+@@ -31,6 +40,10 @@
+     }
+ 
+     location /admin {
++        # CCDC: allow only your team's subnet to reach Django admin
++        # allow 10.X.X.0/24;
++        # deny all;
++        proxy_set_header X-Forwarded-Host "";
+         proxy_set_header Host $host;
+         proxy_set_header X-Real-IP $remote_addr;
+         proxy_set_header X-Forwarded-For $remote_addr;
+diff -ruN -x __pycache__ -x node_modules -x .DS_Store orig/pinry/settings/base.py new/pinry/settings/base.py
+--- a/pinry/settings/base.py	2026-11-21 16:29:59.876000045 +0000
++++ b/pinry/settings/base.py	2026-11-21 16:30:28.308000059 +0000
+@@ -165,8 +165,21 @@
+     'DEFAULT_PAGINATION_CLASS': 'rest_framework.pagination.LimitOffsetPagination',
+     'PAGE_SIZE': API_LIMIT_PER_PAGE,
+     'DEFAULT_AUTHENTICATION_CLASSES': [
+-        'rest_framework.authentication.BasicAuthentication',
++        # CCDC: BasicAuthentication removed (CSRF-free password brute force)
+         'rest_framework.authentication.TokenAuthentication',
+         'rest_framework.authentication.SessionAuthentication',
+-    ]
++    ],
++    # CCDC: rate limits (per gunicorn worker, LocMemCache)
++    'DEFAULT_THROTTLE_CLASSES': [
++        'rest_framework.throttling.AnonRateThrottle',
++        'rest_framework.throttling.UserRateThrottle',
++    ],
++    'DEFAULT_THROTTLE_RATES': {'anon': '120/min', 'user': '300/min'},
+ }
++
++# CCDC: cookie hardening
++SESSION_COOKIE_HTTPONLY = True
++SESSION_COOKIE_SAMESITE = 'Lax'
++CSRF_COOKIE_SAMESITE = 'Lax'
++SECURE_CONTENT_TYPE_NOSNIFF = True
++X_FRAME_OPTIONS = 'DENY'
+diff -ruN -x __pycache__ -x node_modules -x .DS_Store orig/pinry/urls.py new/pinry/urls.py
+--- a/pinry/urls.py	2026-11-21 16:29:59.877000045 +0000
++++ b/pinry/urls.py	2026-11-21 16:30:28.308000059 +0000
+@@ -3,7 +3,6 @@
+ from django.contrib.staticfiles.urls import staticfiles_urlpatterns
+ from django.contrib import admin
+ from django.urls import path, include
+-from rest_framework.documentation import include_docs_urls
+ 
+ from core.views import drf_router
+ 
+@@ -15,7 +14,8 @@
+     # drf api
+     path('api/v2/', include(drf_router.urls)),
+     path('api-auth/', include('rest_framework.urls', namespace="rest_framework")),
+-    path('api/v2/docs/', include_docs_urls(title='PinryAPI', schema_url='/')),
++    # CCDC: API docs/schema disabled
++    # path('api/v2/docs/', include_docs_urls(title='PinryAPI', schema_url='/')),
+ 
+     # old api and views
+     path('admin/', admin.site.urls),
+diff -ruN -x __pycache__ -x node_modules -x .DS_Store orig/users/serializers.py new/users/serializers.py
+--- a/users/serializers.py	2026-11-21 16:29:59.884000045 +0000
++++ b/users/serializers.py	2026-11-21 16:30:28.308000059 +0000
+@@ -76,6 +76,20 @@
+         )
+         return user
+ 
++    def to_representation(self, instance):
++        # CCDC: only show email to the user themselves (was public on every pin)
++        data = super(UserSerializer, self).to_representation(instance)
++        if self.context.get('request') is None or \
++                self.context['request'].user != instance:
++            data.pop('email', None)
++        return data
++
++    def validate_password(self, value):
++        # CCDC: enforce Django's password validators on signup
++        from django.contrib.auth.password_validation import validate_password
++        validate_password(value)
++        return value
++
+     def get_token(self, obj: User):
+         if self.context['request'].user == obj:
+             return create_token_if_necessary(obj).key
+diff -ruN -x __pycache__ -x node_modules -x .DS_Store orig/users/views.py new/users/views.py
+--- a/users/views.py	2026-11-21 16:29:59.885000045 +0000
++++ b/users/views.py	2026-11-21 16:30:48.772000068 +0000
+@@ -1,6 +1,7 @@
+ import json
+ 
+ from django.conf import settings
++from django.core.cache import cache
+ from django.contrib import messages
+ from django.contrib.auth import authenticate, login, logout
+ from django.contrib.auth.decorators import login_required
+@@ -74,12 +75,28 @@
+         return HttpResponseBadRequest(
+             json.dumps({"password": "this field is required"})
+         )
++    # CCDC: lockout after 10 failures per source IP in 5 minutes.
++    # (Per-IP only on purpose: a per-username lock would let red team lock out
++    # the scoring account.) X-Real-IP is only trusted from the local nginx.
++    ip = request.META.get('REMOTE_ADDR', '')
++    if ip in ('127.0.0.1', '::1'):
++        ip = request.META.get('HTTP_X_REAL_IP', ip)
++    keys = ['ccdc-login-ip:%s' % ip]
++    if any(cache.get(k, 0) >= 10 for k in keys):
++        return HttpResponse(json.dumps({"password": "too many attempts, try later"}),
++                            status=429, content_type="application/json")
+     user = authenticate(
+         request,
+         username=data['username'],
+         password=data['password']
+     )
+     if not user:
++        for k in keys:
++            cache.add(k, 0, 300)
++            try:
++                cache.incr(k)
++            except ValueError:
++                cache.set(k, 1, 300)
+         return HttpResponseBadRequest(
+             json.dumps({"password": "username and password doesn't match"})
+         )
