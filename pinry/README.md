@@ -5,7 +5,8 @@ Target box: Ubuntu/Lubuntu 22.04, Pinry in Docker (`getpinry/pinry`) or bare met
 
 | File | What it does |
 |---|---|
-| `pinry_backup.sh` | Backup/restore of the container: consistent SQLite copy, `/data`, app code, `/etc/nginx`, `docker commit` snapshot, and a generated `recreate.sh` |
+| `pinry_backup_bm.sh` | Backup/restore for a **bare-metal** install (`/pinry` + `/data`): consistent SQLite copy, app/data/nginx/startup-unit tarballs, checksums, restore with evidence kept |
+| `pinry_backup.sh` | Backup/restore of a **Docker** container: consistent SQLite copy, `/data`, app code, `/etc/nginx`, `docker commit` snapshot, and a generated `recreate.sh` |
 | `pinry_fix.py` | Patches the code vulns in `core/models.py`, `core/serializers.py`, `users/views.py` (no settings/key changes) |
 | `pinry_apply_patches.sh` | Full patch set (code + settings + nginx) with checks, health test, auto-rollback |
 | `pinry_ccdc.patch` | The same fixes as a unified diff (`patch -p1 < pinry_ccdc.patch` from the Pinry base folder) |
@@ -85,6 +86,17 @@ sudo ./pinry_backup.sh -r <dir>             # restore data + code + nginx (safet
 sudo ./pinry_backup.sh -r <dir> -d          # data only
 ```
 Restore moves the current DB/media/settings/logs to `/data/.pre_restore_<ts>` (evidence) and verifies checksums. If the container is gone: run `<dir>/recreate.sh`, then restore with `-d`.
+
+## pinry_backup_bm.sh (bare metal)
+
+```bash
+sudo ./pinry_backup_bm.sh                       # backup now (defaults: -a /pinry -d /data)
+sudo ./pinry_backup_bm.sh -i 900 -k 8 -o /mnt/elsewhere
+sudo ./pinry_backup_bm.sh -l
+sudo ./pinry_backup_bm.sh -r <dir>              # restore app + data + nginx
+sudo ./pinry_backup_bm.sh -r <dir> -D           # data only
+```
+Errors out if the app folder is missing or has no `manage.py`. Finds the DB from the settings files without running Pinry code. Restore takes a safety backup first, verifies checksums, moves current DB/media/settings/logs to `/data/.pre_restore_<ts>` and old code to `/pinry.pre_restore_<ts>`, then reloads gunicorn and checks that the site responds.
 
 ## pinry_apply_patches.sh
 
